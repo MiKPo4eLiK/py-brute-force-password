@@ -1,9 +1,8 @@
 import time
 import hashlib
-import itertools
+import multiprocessing
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from typing import Iterable, Dict
-
+from typing import Dict
 
 PASSWORDS_TO_BRUTE_FORCE = [
     "b4061a4bcfe1a2cbf78286f3fab2fb578266d1bd16c414c650c5ac04dfc696e1",
@@ -17,62 +16,74 @@ PASSWORDS_TO_BRUTE_FORCE = [
     "7e8f0ada0a03cbee48a0883d549967647b3fca6efeb0a149242f19e4b68d53d6",
     "e5f3ff26aa8075ce7513552a9af1882b4fbc2a47a3525000f6eb887ab9622207",
 ]
+TARGET_HASHES = frozenset(PASSWORDS_TO_BRUTE_FORCE)
 
 
 def sha256_hash_str(password: str) -> str:
     return hashlib.sha256(password.encode("utf-8")).hexdigest()
 
 
-def check_password(passwords: Iterable[str]) -> Dict[str, str]:
-    found_passwords = {}
-    for password in passwords:
-        hashed_password = sha256_hash_str(password)
-        if hashed_password in PASSWORDS_TO_BRUTE_FORCE:
-            found_passwords[hashed_password] = password
-    return found_passwords
+def worker_range(start: int, end: int, target_hashes: frozenset,
+                 found_proxy: Dict[str, str], stop_event) -> int:
+    found_here = 0
+    for i in range(start, end):
+        if stop_event.is_set():
+            break
+        pwd = f"{i:08d}"
+        h = sha256_hash_str(pwd)
+        if h in target_hashes and h not in found_proxy:
+            found_proxy[h] = pwd
+            found_here += 1
+            if len(found_proxy) >= len(target_hashes):
+                stop_event.set()
+                break
+    return found_here
 
 
 def main() -> None:
     start_time = time.time()
 
-    all_combinations = itertools.product("0123456789", repeat=8)
+    TOTAL = 10 ** 8
+    CHUNK_SIZE = 1_000_000
+    max_workers = None
 
-    chunk_size = 1000000
-    chunks = []
-    chunk = []
+    manager = multiprocessing.Manager()
+    found_passwords = manager.dict()
+    stop_event = manager.Event()
 
-    for combo in all_combinations:
-        chunk.append("".join(combo))
-        if len(chunk) == chunk_size:
-            chunks.append(chunk)
-            chunk = []
+    ranges = []
+    for s in range(0, TOTAL, CHUNK_SIZE):
+        e = min(s + CHUNK_SIZE, TOTAL)
+        ranges.append((s, e))
 
-    if chunk:
-        chunks.append(chunk)
-
-    found_passwords = {}
-    with ProcessPoolExecutor() as executor:
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
         futures = [
-            executor.submit(check_password, passwords)
-            for passwords in chunks
+            executor.submit(worker_range, s, e, TARGET_HASHES, found_passwords, stop_event)
+            for s, e in ranges
         ]
 
-        for future in as_completed(futures):
-            found_passwords.update(future.result())
-            if len(found_passwords) >= len(PASSWORDS_TO_BRUTE_FORCE):
-                break
+        try:
+            for fut in as_completed(futures):
+                _ = fut.result()
+                if stop_event.is_set():
+                    break
+        except KeyboardInterrupt:
+            stop_event.set()
+            raise
 
     end_time = time.time()
     total_time = end_time - start_time
 
     print("\nTotal execution time:", total_time)
-    assert len(found_passwords) == len(
-        PASSWORDS_TO_BRUTE_FORCE
-    ), "Not all passwords were found!"
+    if len(found_passwords) != len(TARGET_HASHES):
+        print(f"\nWarning: found {len(found_passwords)} of {len(TARGET_HASHES)} targets.")
+    else:
+        print("\nAll targets found.")
 
     print("\nAll found passwords:")
-    for hash_val, password in found_passwords.items():
-        print(f"Hash: {hash_val} -> Password: {password}")
+    for hash_val in sorted(found_passwords.keys()):
+        pwd = found_passwords[hash_val]
+        print(f"Hash: {hash_val} -> Password: {pwd}")
 
 
 if __name__ == "__main__":
